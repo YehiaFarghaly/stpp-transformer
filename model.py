@@ -4,10 +4,38 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-
+import torch.distributions as D
 from tqdm.auto import tqdm
 
     
+class LatentProcess(nn.Module):
+    def __init__(self, d_model):
+        super(LatentProcess, self).__init__()
+        self.mu = nn.Linear(d_model, d_model)
+        self.sigma = nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        mu = self.mu(x)
+        sigma = torch.exp(self.sigma(x))
+        return mu, sigma
+
+class IntensityFunction(nn.Module):
+    def __init__(self, d_model):
+        super(IntensityFunction, self).__init__()
+        self.d_model = d_model
+        self.intensity_layer = nn.Linear(d_model, 1)
+        
+    def forward(self, z):
+        intensity = torch.exp(self.intensity_layer(z))
+        return intensity
+
+    def log_likelihood(self, z, event_times):
+        intensity = self.forward(z)
+        log_intensity = torch.log(intensity + 1e-9)  # Add epsilon for numerical stability
+        integrated_intensity = torch.cumsum(intensity, dim=1)
+        log_likelihood = log_intensity - integrated_intensity
+        return log_likelihood  
+      
 class InputEmbedding(nn.Module):
     def __init__(self, d_model, input_dim):
         super(InputEmbedding, self).__init__()
@@ -16,7 +44,6 @@ class InputEmbedding(nn.Module):
    
     def forward(self, x):
         # (batch_size, seq_len, input_dim) => (batch_size, seq_len, d_model)
-        print('Input Shape before Input Embedding: ', x.shape)
         return self.embedding(x) * math.sqrt(self.d_model)
 
     
@@ -41,7 +68,6 @@ class PositionEncoding(nn.Module):
         
     def forward(self, x):
         # (batch_size, seq_len, d_model) => (batch_size, seq_len, d_model)
-        print('Input Shape After Input Embedding: ', x.shape)
         x = x + (self.pe[:, :x.shape[1], :]).requires_grad_(False)
         return self.dropout(x)
     
@@ -199,8 +225,9 @@ class ProjectionLayer(nn.Module):
         return self.proj(x)
     
 class Transformer(nn.Module):
-
-    def __init__(self, encoder: Encoder, decoder: Decoder, src_embed: InputEmbedding, tgt_embed: InputEmbedding, src_pos: PositionEncoding, tgt_pos: PositionEncoding, projection_layer: ProjectionLayer) -> None:
+    def __init__(self, encoder: Encoder, decoder: Decoder, src_embed: InputEmbedding, tgt_embed: InputEmbedding, 
+                 src_pos: PositionEncoding, tgt_pos: PositionEncoding, projection_layer: ProjectionLayer,
+                 d_model: int):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -209,23 +236,33 @@ class Transformer(nn.Module):
         self.src_pos = src_pos
         self.tgt_pos = tgt_pos
         self.projection_layer = projection_layer
+        self.latent_process = LatentProcess(d_model)
+        self.intensity_function = IntensityFunction(d_model)
 
     def encode(self, src, src_mask):
-        # (batch, seq_len, d_model)
         src = self.src_embed(src)
         src = self.src_pos(src)
         return self.encoder(src, src_mask)
     
     def decode(self, encoder_output: torch.Tensor, src_mask: torch.Tensor, tgt: torch.Tensor, tgt_mask: torch.Tensor):
-        # (batch, seq_len, d_model)
         tgt = self.tgt_embed(tgt)
         tgt = self.tgt_pos(tgt)
         return self.decoder(tgt, encoder_output, src_mask, tgt_mask)
     
     def project(self, x):
-        # (batch, seq_len, input_dim)
         return self.projection_layer(x)
     
+    def forward(self, src, tgt, src_mask, tgt_mask):
+        encoder_output = self.encode(src, src_mask)
+        decoder_output = self.decode(encoder_output, src_mask, tgt, tgt_mask)
+        latent_mu, latent_sigma = self.latent_process(decoder_output)
+        z = latent_mu + torch.randn_like(latent_mu) * latent_sigma
+        predictions = self.project(z)
+        return predictions, z
+    
+    def log_likelihood(self, z, event_times):
+        return self.intensity_function.log_likelihood(z, event_times)
+ 
 def build_transformer(src_input_dim: int, tgt_input_dim: int, src_seq_len: int, tgt_seq_len: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048) -> Transformer:
     # Create the embedding layers
     src_embed = InputEmbedding(d_model, src_input_dim)
@@ -260,7 +297,7 @@ def build_transformer(src_input_dim: int, tgt_input_dim: int, src_seq_len: int, 
     projection_layer = ProjectionLayer(d_model, tgt_input_dim)
     
     # Create the transformer
-    transformer = Transformer(encoder, decoder, src_embed, tgt_embed, src_pos, tgt_pos, projection_layer)
+    transformer = Transformer(encoder, decoder, src_embed, tgt_embed, src_pos, tgt_pos, projection_layer, d_model)
     
     # Initialize the parameters
     for p in transformer.parameters():
