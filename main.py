@@ -24,12 +24,12 @@ def collate_fn(batch):
     inputs, targets = zip(*batch)
     inputs = torch.stack(inputs)
     targets = torch.stack(targets)
-    return inputs, targets
+    event_times = inputs[:, :, -1]  
+    return inputs, targets, event_times
 
-# Load the dataset
+
 dataset = SpatiotemporalDataset('synthetic_spatiotemporal_events.csv', 10)
 
-# Split the dataset into training and validation sets (80% training, 20% validation)
 train_size = int(0.8 * len(dataset))
 val_size = len(dataset) - train_size
 train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -37,7 +37,6 @@ train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
 val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
 
-# Define hyperparameters
 src_input_dim = 3 
 tgt_input_dim = 3
 src_seq_len = 10
@@ -47,40 +46,31 @@ N = 6
 h = 8
 dropout = 0.1
 d_ff = 2048
-epochs = 100  # Increase the number of epochs
+epochs = 100  
 learning_rate = 0.001
-patience = 10  # Early stopping patience
+patience = 10  
 
 model = build_transformer(src_input_dim, tgt_input_dim, src_seq_len, tgt_seq_len, d_model, N, h, dropout, d_ff)
 
-# Define the loss function and optimizer
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-# Training loop with early stopping
 best_val_loss = float('inf')
 patience_counter = 0
 
-# Update the training loop
 for epoch in range(epochs):
     model.train()
     running_loss = 0.0
-    for inputs, targets in train_dataloader:
+    for inputs, targets, event_times in train_dataloader:
         optimizer.zero_grad()
         src_mask = None
         tgt_mask = None
-        encoder_output = model.encode(inputs, src_mask)
-        decoder_output = model.decode(encoder_output, src_mask, targets.unsqueeze(1), tgt_mask)
         predictions, z = model(inputs, targets.unsqueeze(1), src_mask, tgt_mask)
         
-        # Compute regression loss
-        regression_loss = criterion(predictions.squeeze(), targets)
+        regression_loss = criterion(predictions, targets)
         
-        # Compute log likelihood loss
-        event_times = inputs[:, :, -1]  # Assuming time is the last feature in input
-        log_likelihood_loss = -model.log_likelihood(z, event_times).mean()
+        log_likelihood_loss = -model.log_likelihood(z, event_times)
         
-        # Combine losses
         loss = regression_loss + log_likelihood_loss
         
         loss.backward()
@@ -90,20 +80,16 @@ for epoch in range(epochs):
     
     avg_train_loss = running_loss / len(train_dataloader)
 
-    # Validate the model
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
-        for inputs, targets in val_dataloader:
+        for inputs, targets, event_times in val_dataloader:
             src_mask = None
             tgt_mask = None
-            encoder_output = model.encode(inputs, src_mask)
-            decoder_output = model.decode(encoder_output, src_mask, targets.unsqueeze(1), tgt_mask)
             predictions, z = model(inputs, targets.unsqueeze(1), src_mask, tgt_mask)
             
-            regression_loss = criterion(predictions.squeeze(), targets)
-            event_times = inputs[:, :, -1]
-            log_likelihood_loss = -model.log_likelihood(z, event_times).mean()
+            regression_loss = criterion(predictions, targets)
+            log_likelihood_loss = -model.log_likelihood(z, event_times)
             
             loss = regression_loss + log_likelihood_loss
             val_loss += loss.item()
@@ -122,6 +108,3 @@ for epoch in range(epochs):
     if patience_counter >= patience:
         print("Early stopping triggered")
         break
-
-model.load_state_dict(torch.load('best_transformer_model.pth'))
-model.eval()

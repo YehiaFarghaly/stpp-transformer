@@ -9,32 +9,47 @@ from tqdm.auto import tqdm
 
     
 class LatentProcess(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, d_model, rnn_hidden_size=256):
         super(LatentProcess, self).__init__()
-        self.mu = nn.Linear(d_model, d_model)
-        self.sigma = nn.Linear(d_model, d_model)
+        self.rnn = nn.GRU(d_model, rnn_hidden_size, batch_first=True)
+        self.mu = nn.Linear(rnn_hidden_size, d_model)
+        self.sigma = nn.Linear(rnn_hidden_size, d_model)
 
     def forward(self, x):
-        mu = self.mu(x)
-        sigma = torch.exp(self.sigma(x))
+        rnn_out, _ = self.rnn(x)  # (batch, seq_len, d_model) => (batch, seq_len, rnn_hidden_size)
+        mu = self.mu(rnn_out)
+        sigma = torch.exp(self.sigma(rnn_out)) 
         return mu, sigma
+
 
 class IntensityFunction(nn.Module):
     def __init__(self, d_model):
         super(IntensityFunction, self).__init__()
-        self.d_model = d_model
         self.intensity_layer = nn.Linear(d_model, 1)
-        
+
     def forward(self, z):
-        intensity = torch.exp(self.intensity_layer(z))
+        # Apply exponential to ensure positive intensity
+        intensity = torch.exp(self.intensity_layer(z))  # (batch, seq_len, d_model) -> (batch, seq_len, 1)
         return intensity
 
     def log_likelihood(self, z, event_times):
-        intensity = self.forward(z)
+        # Calculate the intensity for each latent state
+        intensity = self.forward(z)  # (batch, seq_len, 1)
+        
         log_intensity = torch.log(intensity + 1e-9)  # Add epsilon for numerical stability
-        integrated_intensity = torch.cumsum(intensity, dim=1)
-        log_likelihood = log_intensity - integrated_intensity
-        return log_likelihood  
+        
+        event_indices = event_times.unsqueeze(-1).long()  # Convert event times to indices
+        
+        event_indices = torch.clamp(event_indices, 0, intensity.size(1) - 1)
+        
+        log_intensity_values = log_intensity.gather(1, event_indices)  # (batch, seq_len, 1)
+        
+        integrated_intensity = torch.cumsum(intensity, dim=1)  # (batch, seq_len, 1)
+        
+        log_likelihood = log_intensity_values.sum(dim=1) - integrated_intensity.sum(dim=1)
+        
+        return log_likelihood.mean()
+
       
 class InputEmbedding(nn.Module):
     def __init__(self, d_model, input_dim):
@@ -257,12 +272,12 @@ class Transformer(nn.Module):
         decoder_output = self.decode(encoder_output, src_mask, tgt, tgt_mask)
         latent_mu, latent_sigma = self.latent_process(decoder_output)
         z = latent_mu + torch.randn_like(latent_mu) * latent_sigma
-        predictions = self.project(z)
+        predictions = self.project(z[:, -1, :])  # Predict based on the last timestep of the sequence
         return predictions, z
     
     def log_likelihood(self, z, event_times):
         return self.intensity_function.log_likelihood(z, event_times)
- 
+
 def build_transformer(src_input_dim: int, tgt_input_dim: int, src_seq_len: int, tgt_seq_len: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048) -> Transformer:
     # Create the embedding layers
     src_embed = InputEmbedding(d_model, src_input_dim)
