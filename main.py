@@ -3,33 +3,50 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
-import math
 from model import build_transformer
+import pandas as pd
+import torch
 
-class SpatiotemporalDataset(Dataset):
+
+class NYPDSpatiotemporalDataset(Dataset):
     def __init__(self, csv_file, seq_len):
         self.data = pd.read_csv(csv_file)
-        self.seq_len = seq_len
-    
+        self.seq_len = seq_len + 1
+        self.data = self.data.dropna(subset=['LATITUDE', 'LONGITUDE', 'DATE', 'TIME'])
+
+        # Combine date and time into a single datetime column and convert to timestamp
+        self.data['DATETIME'] = pd.to_datetime(self.data['DATE'] + ' ' + self.data['TIME'])
+        self.data['TIMESTAMP'] = self.data['DATETIME'].apply(lambda x: x.timestamp())
+
+        # Normalize the timestamps using min-max normalization
+        min_timestamp = self.data['TIMESTAMP'].min()
+        max_timestamp = self.data['TIMESTAMP'].max()
+        self.data['TIMESTAMP'] = (self.data['TIMESTAMP'] - min_timestamp) / (max_timestamp - min_timestamp)
+
+        # Select relevant columns
+        self.data = self.data[['LATITUDE', 'LONGITUDE', 'TIMESTAMP']]
+
     def __len__(self):
         return len(self.data) - self.seq_len
-    
+
     def __getitem__(self, idx):
         events = self.data.iloc[idx:idx + self.seq_len]
-        x = torch.tensor(events[['x', 'y', 'time']].values, dtype=torch.float32)
-        y = torch.tensor(events[['x', 'y', 'time']].values[-1], dtype=torch.float32)
+        x = torch.tensor(events[['LATITUDE', 'LONGITUDE', 'TIMESTAMP']].values[:self.seq_len - 1], dtype=torch.float32)
+        y = torch.tensor(events[['LATITUDE', 'LONGITUDE', 'TIMESTAMP']].values[-1], dtype=torch.float32)
         return x, y
+
 
 def collate_fn(batch):
     inputs, targets = zip(*batch)
     inputs = torch.stack(inputs)
     targets = torch.stack(targets)
-    event_times = inputs[:, :, -1]  
-    return inputs, targets, event_times
+    return inputs, targets
 
 
-dataset = SpatiotemporalDataset('synthetic_spatiotemporal_events.csv', 10)
+# Load the dataset
+dataset = NYPDSpatiotemporalDataset('database.csv', 10)
 
+# Split the dataset into training and validation sets (80% training, 20% validation)
 train_size = int(0.8 * len(dataset))
 val_size = len(dataset) - train_size
 train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -37,6 +54,7 @@ train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
 val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
 
+# Define hyperparameters
 src_input_dim = 3 
 tgt_input_dim = 3
 src_seq_len = 10
@@ -46,31 +64,42 @@ N = 6
 h = 8
 dropout = 0.1
 d_ff = 2048
-epochs = 100  
+epochs = 10  # Increase the number of epochs
 learning_rate = 0.001
-patience = 10  
+patience = 10  # Early stopping patience
 
 model = build_transformer(src_input_dim, tgt_input_dim, src_seq_len, tgt_seq_len, d_model, N, h, dropout, d_ff)
 
+# Define the loss function and optimizer
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
+# Training loop with early stopping
 best_val_loss = float('inf')
 patience_counter = 0
 
+# Update the training loop
 for epoch in range(epochs):
     model.train()
     running_loss = 0.0
-    for inputs, targets, event_times in train_dataloader:
+    for inputs, targets in train_dataloader:
         optimizer.zero_grad()
         src_mask = None
-        tgt_mask = None
-        predictions, z = model(inputs, targets.unsqueeze(1), src_mask, tgt_mask)
         
-        regression_loss = criterion(predictions, targets)
+        # Set T to the maximum time in the current batch
+        T = targets[:, -1]
+        # Forward pass
+        predictions, z = model(inputs, src_mask, T)
         
-        log_likelihood_loss = -model.log_likelihood(z, event_times)
+        # Compute regression loss
+        regression_loss = criterion(predictions.squeeze(), targets)
         
+        # Compute log likelihood loss
+        event_times = inputs[:, :, -1]  # Assuming time is the last feature in input
+        event_locations = inputs[:, :, :-1]  # Assuming the rest are locations
+        log_likelihood_loss = -model.log_likelihood(z, event_times, event_locations).mean()
+        
+        # Combine losses
         loss = regression_loss + log_likelihood_loss
         
         loss.backward()
@@ -80,16 +109,26 @@ for epoch in range(epochs):
     
     avg_train_loss = running_loss / len(train_dataloader)
 
+    # Validate the model
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
-        for inputs, targets, event_times in val_dataloader:
+        for inputs, targets in val_dataloader:
             src_mask = None
-            tgt_mask = None
-            predictions, z = model(inputs, targets.unsqueeze(1), src_mask, tgt_mask)
             
-            regression_loss = criterion(predictions, targets)
-            log_likelihood_loss = -model.log_likelihood(z, event_times)
+            # Set T to the maximum time in the current batch
+            T = targets[:, -1]
+            
+            # Forward pass
+            predictions, z = model(inputs, src_mask, T)
+            
+            # Compute regression loss
+            regression_loss = criterion(predictions.squeeze(), targets)
+            
+            # Compute log likelihood loss
+            event_times = inputs[:, :, -1]
+            event_locations = inputs[:, :, :-1]
+            log_likelihood_loss = -model.log_likelihood(z, event_times, event_locations).mean()
             
             loss = regression_loss + log_likelihood_loss
             val_loss += loss.item()
@@ -108,3 +147,6 @@ for epoch in range(epochs):
     if patience_counter >= patience:
         print("Early stopping triggered")
         break
+
+model.load_state_dict(torch.load('best_transformer_model.pth'))
+model.eval()
