@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
-from model import build_transformer
+from model import Transformer
 import pandas as pd
 import torch
 
@@ -56,51 +56,42 @@ val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_f
 
 # Define hyperparameters
 src_input_dim = 3 
-tgt_input_dim = 3
 src_seq_len = 10
-tgt_seq_len = 1
 d_model = 512
 N = 6
 h = 8
 dropout = 0.1
 d_ff = 2048
-epochs = 10  # Increase the number of epochs
+epochs = 100  # Increase the number of epochs
 learning_rate = 0.001
 patience = 10  # Early stopping patience
+latent_dim = 1
 
-model = build_transformer(src_input_dim, tgt_input_dim, src_seq_len, tgt_seq_len, d_model, N, h, dropout, d_ff)
+model = Transformer(src_input_dim, d_model, N, h, d_ff, dropout, src_seq_len, latent_dim)
 
-# Define the loss function and optimizer
-criterion = nn.MSELoss()
+# Define the optimizer
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
 # Training loop with early stopping
 best_val_loss = float('inf')
 patience_counter = 0
 
-# Update the training loop
 for epoch in range(epochs):
     model.train()
     running_loss = 0.0
     for inputs, targets in train_dataloader:
         optimizer.zero_grad()
         src_mask = None
-        
         # Set T to the maximum time in the current batch
         T = targets[:, -1]
         # Forward pass
-        predictions, z = model(inputs, src_mask, T)
-        
-        # Compute regression loss
-        regression_loss = criterion(predictions.squeeze(), targets)
-        
+        mu, alpha, beta, gamma = model(inputs, src_mask)
+        # print('results of the prediction mu, alpha, beta, gamma: ', mu, alpha, beta, gamma)
         # Compute log likelihood loss
         event_times = inputs[:, :, -1]  # Assuming time is the last feature in input
         event_locations = inputs[:, :, :-1]  # Assuming the rest are locations
-        log_likelihood_loss = -model.log_likelihood(z, event_times, event_locations).mean()
-        
-        # Combine losses
-        loss = regression_loss + log_likelihood_loss
+        log_likelihood_loss = -model.log_likelihood(event_times, event_locations, mu, alpha, beta, gamma).mean()
+        loss = log_likelihood_loss
         
         loss.backward()
         optimizer.step()
@@ -120,17 +111,13 @@ for epoch in range(epochs):
             T = targets[:, -1]
             
             # Forward pass
-            predictions, z = model(inputs, src_mask, T)
-            
-            # Compute regression loss
-            regression_loss = criterion(predictions.squeeze(), targets)
+            mu, alpha, beta, gamma = model(inputs, src_mask)
             
             # Compute log likelihood loss
             event_times = inputs[:, :, -1]
             event_locations = inputs[:, :, :-1]
-            log_likelihood_loss = -model.log_likelihood(z, event_times, event_locations).mean()
-            
-            loss = regression_loss + log_likelihood_loss
+            log_likelihood_loss = -model.log_likelihood(event_times, event_locations, mu, alpha, beta, gamma).mean()
+            loss = log_likelihood_loss
             val_loss += loss.item()
     
     avg_val_loss = val_loss / len(val_dataloader)

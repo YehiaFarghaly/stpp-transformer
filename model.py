@@ -8,132 +8,139 @@ import torch.distributions as D
 from tqdm.auto import tqdm
 
     
-class LatentProcess(nn.Module):
-    def __init__(self, d_model, rnn_hidden_size=256):
-        super(LatentProcess, self).__init__()
-        self.rnn = nn.GRU(d_model, rnn_hidden_size, batch_first=True)
-        self.mu = nn.Linear(rnn_hidden_size, d_model)
-        self.sigma = nn.Linear(rnn_hidden_size, d_model)
+def hawkes_intensity_at_point(event_times, event_locations, mu, alpha, beta, gamma, point_time, point_location):
+    base_intensity = mu
 
-    def forward(self, x):
-        rnn_out, _ = self.rnn(x)  
-        mu = self.mu(rnn_out)
-        sigma = torch.exp(self.sigma(rnn_out)) 
-        return mu, sigma
+    # Compute temporal excitation
+    time_diffs = point_time - event_times
+    excitation_temporal = alpha * torch.exp(-beta * time_diffs)
+    # print('inside intensity function with time diff = ', time_diffs)
+    # Compute spatial excitation
+    spatial_diffs = point_location - event_locations
+    spatial_distances = torch.norm(spatial_diffs, dim=-1)
+    excitation_spatial = torch.exp(-gamma * spatial_distances)
+    # print('inside intensity function with spatial_excitation = ', spatial_diffs)
+
+    # Total excitation
+    excitation = excitation_temporal * excitation_spatial
+    excitation_sum = excitation.sum()
+    intensity = base_intensity + excitation_sum
+    return intensity
 
 
-class HawkesIntensityFunction(nn.Module):
-    def __init__(self, d_model):
-        super(HawkesIntensityFunction, self).__init__()
-        self.mu = nn.Parameter(torch.ones(1))  
-        self.alpha = nn.Parameter(torch.ones(1))  
-        self.beta = nn.Parameter(torch.ones(1))  
-        self.gamma = nn.Parameter(torch.ones(1))  
 
-        self.intensity_layer = nn.Linear(d_model, 1)
 
-    def forward(self, z, event_times, event_locations):
+def calculate_upper_bound(event_times, event_locations, mu, alpha, beta, gamma, T, spatial_range):
+    max_intensity = 0.0
 
-        base_intensity = torch.exp(self.intensity_layer(z))
-        event_times = event_times.unsqueeze(-1)
-        time_diffs = event_times - event_times.transpose(1, 2)
-        time_diffs = torch.triu(time_diffs, diagonal=1)
-        excitation_temporal = self.alpha * torch.exp(-self.beta * time_diffs)
-        event_locations = event_locations.unsqueeze(-2)
-        spatial_diffs = event_locations - event_locations.transpose(1, 2)
-        spatial_distances = torch.norm(spatial_diffs, dim=-1)
-        spatial_diffs = torch.triu(spatial_distances, diagonal=1)
-        excitation_spatial = torch.exp(-self.gamma * spatial_diffs)
-        excitation = excitation_temporal * excitation_spatial
-        excitation_sum = excitation.sum(dim=2, keepdim=True)
-        intensity = self.mu + base_intensity + excitation_sum
-        return intensity
-    
-    def log_likelihood(self, z, event_times, event_locations):
-        intensity = self.forward(z, event_times, event_locations)
-        log_intensity = torch.log(intensity + 1e-9)
-        event_indices = event_times.unsqueeze(-1).long()
-        event_indices = torch.clamp(event_indices, 0, intensity.size(1) - 1)
-        log_intensity_values = log_intensity.gather(1, event_indices)
-        integrated_intensity = torch.cumsum(intensity, dim=1)
-        log_likelihood = log_intensity_values.sum(dim=1) - integrated_intensity.sum(dim=1)
-        return log_likelihood.mean()
-    
-    
-    
-    def single_event_intensity(self, z, event_times, event_locations, predicted_time, predicted_location):
-        base_intensity = torch.exp(self.intensity_layer(z[:, -1, :]))
-        predicted_time = predicted_time.unsqueeze(-1)
-        time_diffs = predicted_time - event_times
-        excitation_temporal = self.alpha * torch.exp(-self.beta * time_diffs)
-        predicted_location = predicted_location.unsqueeze(1)
-        spatial_diffs = predicted_location - event_locations
-        spatial_distances = torch.norm(spatial_diffs, dim=-1)
-        excitation_spatial = torch.exp(-self.gamma * spatial_distances)
+    for t in torch.arange(0, T, 0.1):  # Discretize time interval
+        for x in torch.arange(spatial_range[0], spatial_range[1], 0.1):
+            for y in torch.arange(spatial_range[2], spatial_range[3], 0.1):
+                point_time = t
+                point_location = torch.tensor([x, y])
+                intensity = hawkes_intensity_at_point(event_times, event_locations, mu, alpha, beta, gamma, point_time, point_location)
+                if intensity > max_intensity:
+                    max_intensity = intensity
+
+    return max_intensity
+
+# Function to generate events using thinning
+import torch
+import torch.distributions
+
+def generate_event_thinning(event_data, T, model, spatial_range):
+    batch_size = event_data.shape[0]
+    all_predicted_events = []
+    all_rejected_events = []
+    for i in range(batch_size):
+        # Extract event times and locations
+        current_time = event_data[i, -1, -1].item()
+        current_location = event_data[i, -1, :-1]
+        times = event_data[i, :, -1].tolist()
+        locations = event_data[i, :, :-1].tolist()
+
+        predicted_events = []
+        rejected_events = []
+
+        accepted_event = False
+
+        # Predict Hawkes process parameters using the model
+        mu, alpha, beta, gamma = model(event_data[i].unsqueeze(0), None)
+        # print('mu: ', mu, " alpha: ", alpha, " beta: ", beta, "gamma: ", gamma)
+        # Flatten the parameters
+        mu = mu.squeeze().item()
+        alpha = alpha.squeeze().item()
+        beta = beta.squeeze().item()
+        gamma = gamma.squeeze().item()
+        # print('inside batch number ', i)
+        # print('mu = ', mu)
+        # print('alpha = ', alpha)
+        # print('beta = ', beta)
+        # print('gamma = ', gamma)
+
+        # Calculate upper bound
+        upper_bound = calculate_upper_bound(
+            event_data[i, :, -1], event_data[i, :, :-1],
+            mu, alpha, beta, gamma, T[i].item(),
+            [
+                event_data[i, :, 0].min(), event_data[i, :, 0].max(),
+                event_data[i, :, 1].min(), event_data[i, :, 1].max()
+            ]
+        )
         
-        excitation = excitation_temporal * excitation_spatial
-        excitation_sum = excitation.sum(dim=1, keepdim=True)
-        intensity = torch.exp(self.mu) + base_intensity + excitation_sum
-        return intensity
+        upper_bound = upper_bound * 2
+        while not accepted_event:
+            # print('upper bound = ', upper_bound)
+            # print('yea the infinite loop is here no accepted event :(')
+            inter_event_time = torch.distributions.Exponential(upper_bound).sample().item()
+            candidate_time = current_time + inter_event_time
+            if candidate_time > T[i].item():
+                break
 
+            # Generate candidate location using uniform distribution
+            candidate_location = torch.distributions.Uniform(
+                current_location - spatial_range / 2,
+                current_location + spatial_range / 2
+            ).sample().squeeze(0)
 
-    def generate_event_thinning(self, z, event_times, event_locations, T):
-        batch_size = event_times.shape[0]
-        all_predicted_times = []
-        all_predicted_locations = []
-        for i in range(batch_size):
-            current_time = event_times[i, -1].item()
-            current_location = event_locations[i, -1, :]
-            times = event_times[i].tolist()
-            locations = event_locations[i].tolist()
+            # Pass the parameters here
+            candidate_intensity = hawkes_intensity_at_point(
+                event_data[i, :, -1], event_data[i, :, :-1],
+                mu, alpha, beta, gamma, candidate_time, candidate_location
+            )
+            # print('candidate time: ', candidate_time)
+            # print('candidate location: ', candidate_location)
+            # print('candidate intensity: ', candidate_intensity)
 
-            predicted_times = []
-            predicted_locations = []
-
-            accepted_event = False
-
-            while not accepted_event:
-                upper_bound = self.single_event_intensity(z[i:i+1], event_times[i:i+1], event_locations[i:i+1], torch.tensor([current_time]), current_location.unsqueeze(0)).max().item()
-                inter_event_time = torch.distributions.Exponential(upper_bound).sample().item()
-                candidate_time = current_time + inter_event_time
-                if candidate_time > T[i].item():
-                    break
-
-                candidate_location = torch.distributions.Normal(current_location, 1.0).sample().squeeze(0)
-                candidate_intensity = self.single_event_intensity(z[i:i+1], torch.tensor(times).unsqueeze(0), torch.tensor(locations).unsqueeze(0), torch.tensor([candidate_time]), candidate_location.unsqueeze(0))
-                acceptance_prob = candidate_intensity / upper_bound
-
-                if torch.rand(1).item() < acceptance_prob:
-                    predicted_times.append(candidate_time)
-                    predicted_locations.append(candidate_location)
-                    current_time = candidate_time
-                    current_location = candidate_location
-                    accepted_event = True
-
-            if len(predicted_times) == 0:
-                candidate_time = current_time + torch.distributions.Exponential(upper_bound).sample().item()
-                candidate_location = torch.distributions.Normal(current_location, 1.0).sample().squeeze(0)
-                predicted_times.append(candidate_time)
-                predicted_locations.append(candidate_location)
+            acceptance_prob = candidate_intensity / upper_bound
+            
+            if torch.rand(1).item() < acceptance_prob:
+                predicted_events.append(torch.cat([candidate_location, torch.tensor([candidate_time])]))
                 current_time = candidate_time
                 current_location = candidate_location
-                times.append(candidate_time)
-                locations.append(candidate_location.tolist())
+                accepted_event = True
+            else:
+                rejected_events.append(torch.cat([candidate_location, torch.tensor([candidate_time])]))
 
-            all_predicted_times.append(predicted_times)
-            all_predicted_locations.append(torch.stack(predicted_locations))
+        if len(predicted_events) == 0:
+            candidate_time = current_time + torch.distributions.Exponential(upper_bound).sample().item()
+            candidate_location = torch.distributions.Uniform(
+                current_location - spatial_range / 2,
+                current_location + spatial_range / 2
+            ).sample().squeeze(0)
+            predicted_events.append(torch.cat([candidate_location, torch.tensor([candidate_time])]))
+            current_time = candidate_time
+            current_location = candidate_location
+            times.append(candidate_time)
+            locations.append(candidate_location.tolist())
 
-        max_length = max(len(pt) for pt in all_predicted_times)
-        padded_times = [pt + [0] * (max_length - len(pt)) for pt in all_predicted_times]
-        all_predicted_times_tensor = torch.tensor(padded_times)
+        all_predicted_events.append(torch.stack(predicted_events))
+        if rejected_events:
+            all_rejected_events.append(torch.stack(rejected_events))
 
-        all_predicted_locations_tensor = torch.cat(all_predicted_locations, dim=0)
-        return all_predicted_times_tensor, all_predicted_locations_tensor
-
+    return all_predicted_events, all_rejected_events
 
 
-
-   
 class InputEmbedding(nn.Module):
     def __init__(self, d_model, input_dim):
         super(InputEmbedding, self).__init__()
@@ -249,169 +256,111 @@ class MultiHeadAttentionBlock(nn.Module):
         # (batch, seq_len, d_model) --> (batch, seq_len, d_model)  
         return self.w_o(x)
     
-class ResidualConnection(nn.Module):
-    
-        def __init__(self, features: int, dropout: float) -> None:
-            super().__init__()
-            self.dropout = nn.Dropout(dropout)
-            self.norm = LayerNormalization(features)
-    
-        def forward(self, x, sublayer):
-            return x + self.dropout(sublayer(self.norm(x)))
-    
-    
+     
 class EncoderBlock(nn.Module):
-
-    def __init__(self, features: int, self_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForward, dropout: float) -> None:
+    def __init__(self, d_model: int, h: int, d_ff: int, dropout: float):
         super().__init__()
-        self.self_attention_block = self_attention_block
-        self.feed_forward_block = feed_forward_block
-        self.residual_connections = nn.ModuleList([ResidualConnection(features, dropout) for _ in range(2)])
+        self.attention = MultiHeadAttentionBlock(d_model, h, dropout)
+        self.norm_1 = LayerNormalization()
+        self.ff = FeedForward(d_model, d_ff, dropout)
+        self.norm_2 = LayerNormalization()
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, src_mask):
-        x = self.residual_connections[0](x, lambda x: self.self_attention_block(x, x, x, src_mask))
-        x = self.residual_connections[1](x, self.feed_forward_block)
-        return x
-    
+    def forward(self, src, src_mask):
+        src2 = self.norm_1(src)
+        src = src + self.dropout(self.attention(src2, src2, src2, src_mask))
+        src2 = self.norm_2(src)
+        src = src + self.dropout(self.ff(src2))
+        return src
+
 class Encoder(nn.Module):
-
-    def __init__(self, features: int, layers: nn.ModuleList) -> None:
+    def __init__(self, input_dim: int, d_model: int, N: int, h: int, d_ff: int, dropout: float, seq_len: int):
         super().__init__()
-        self.layers = layers
-        self.norm = LayerNormalization(features)
+        self.embedding = InputEmbedding(d_model, input_dim)
+        self.pe = PositionEncoding(d_model, seq_len, dropout)
+        self.layers = nn.ModuleList([EncoderBlock(d_model, h, d_ff, dropout) for _ in range(N)])
+        self.norm = LayerNormalization()
 
-    def forward(self, x, mask):
+    def forward(self, src, src_mask):
+        src = self.embedding(src)
+        src = self.pe(src)
         for layer in self.layers:
-            x = layer(x, mask)
-        return self.norm(x)
-    
-class DecoderBlock(nn.Module):
+            src = layer(src, src_mask)
+        return self.norm(src)
 
-    def __init__(self, features: int, self_attention_block: MultiHeadAttentionBlock, cross_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForward, dropout: float) -> None:
-        super().__init__()
-        self.self_attention_block = self_attention_block
-        self.cross_attention_block = cross_attention_block
-        self.feed_forward_block = feed_forward_block
-        self.residual_connections = nn.ModuleList([ResidualConnection(features, dropout) for _ in range(3)])
-
-    def forward(self, x, encoder_output, src_mask, tgt_mask):
-        x = self.residual_connections[0](x, lambda x: self.self_attention_block(x, x, x, tgt_mask))
-        x = self.residual_connections[1](x, lambda x: self.cross_attention_block(x, encoder_output, encoder_output, src_mask))
-        x = self.residual_connections[2](x, self.feed_forward_block)
-        return x
-    
 class Decoder(nn.Module):
-
-    def __init__(self, features: int, layers: nn.ModuleList) -> None:
+    def __init__(self, d_model: int, latent_dim: int):
         super().__init__()
-        self.layers = layers
-        self.norm = LayerNormalization(features)
+        self.fc_mu = nn.Linear(d_model, latent_dim)
+        self.fc_alpha = nn.Linear(d_model, latent_dim)
+        self.fc_beta = nn.Linear(d_model, latent_dim)
+        self.fc_gamma = nn.Linear(d_model, latent_dim)
+        
+    def forward(self, x, src_mask):
+        mu = F.softplus(self.fc_mu(x.mean(dim=1)))
+        alpha = F.softplus(self.fc_alpha(x.mean(dim=1)))
+        beta = F.softplus(self.fc_beta(x.mean(dim=1)))
+        gamma = F.softplus(self.fc_gamma(x.mean(dim=1)))
+        return mu, alpha, beta, gamma
 
-    def forward(self, x, encoder_output, src_mask, tgt_mask):
-        for layer in self.layers:
-            x = layer(x, encoder_output, src_mask, tgt_mask)
-        return self.norm(x)
-
-class ProjectionLayer(nn.Module):
-
-    def __init__(self, d_model, input_dim) -> None:
-        super().__init__()
-        self.proj = nn.Linear(d_model, input_dim)
-
-    def forward(self, x) -> None:
-        # (batch, seq_len, d_model) --> (batch, seq_len, input_dim)
-        return self.proj(x)
-    
 class Transformer(nn.Module):
-    def __init__(self, encoder: Encoder, decoder: Decoder, src_embed: InputEmbedding, tgt_embed: InputEmbedding, 
-                 src_pos: PositionEncoding, tgt_pos: PositionEncoding, projection_layer: ProjectionLayer,
-                 d_model: int):
+    def __init__(self, input_dim: int, d_model: int, N: int, h: int, d_ff: int, dropout: float, seq_len: int, latent_dim: int):
         super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.src_pos = src_pos
-        self.tgt_pos = tgt_pos
-        self.projection_layer = projection_layer
-        self.latent_process = LatentProcess(d_model)
-        self.intensity_function = HawkesIntensityFunction(d_model)
+        self.encoder = Encoder(input_dim, d_model, N, h, d_ff, dropout, seq_len)
+        self.decoder = Decoder(d_model, latent_dim)
 
-    def encode(self, src, src_mask):
-        src = self.src_embed(src)
-        src = self.src_pos(src)
-        return self.encoder(src, src_mask)
+    def forward(self, src, src_mask):
+        enc_output = self.encoder(src, src_mask)
+        mu, alpha, beta, gamma = self.decoder(enc_output, src_mask)
+        return mu, alpha, beta, gamma
     
-    def decode(self, encoder_output: torch.Tensor, src_mask: torch.Tensor, tgt: torch.Tensor, tgt_mask: torch.Tensor):
-        tgt = self.tgt_embed(tgt)
-        tgt = self.tgt_pos(tgt)
-        return self.decoder(tgt, encoder_output, src_mask, tgt_mask)
-    
-    def project(self, x):
-        return self.projection_layer(x)
-    
-    def forward(self, src, src_mask, T):
-        # Encoding
-        encoder_output = self.encode(src, src_mask)
-        
-        # Latent process
-        latent_mu, latent_sigma = self.latent_process(encoder_output)
-        z = latent_mu + torch.randn_like(latent_mu) * latent_sigma
-        
-        # Get the event times and locations from the source sequence
-        event_times = src[:, :, -1]
-        event_locations = src[:, :, :-1]
-        
-        # Generate the next event's time and location using the thinning algorithm
-        predicted_time, predicted_location = self.intensity_function.generate_event_thinning(z, event_times, event_locations, T)
-        # Combine predicted time and location
-        predicted_event = torch.cat([predicted_location, predicted_time], dim=-1)
-        
-        return predicted_event, z
-    
-    def log_likelihood(self, z, event_times, event_locations):
-        return self.intensity_function.log_likelihood(z, event_times, event_locations)
 
-    
-def build_transformer(src_input_dim: int, tgt_input_dim: int, src_seq_len: int, tgt_seq_len: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048) -> Transformer:
-    # Create the embedding layers
-    src_embed = InputEmbedding(d_model, src_input_dim)
-    tgt_embed = InputEmbedding(d_model, tgt_input_dim)
+    def log_likelihood(self, event_times, event_locations, mu, alpha, beta, gamma, dt=0.1, dx=0.1, dy=0.1):        
+        log_intensity_sum = 0
+        integrated_intensity_sum = 0
+        eps = 1e-9  # Small value to prevent log(0)
+        for batch_idx in range(event_times.shape[0]):
+            batch_event_times = event_times[batch_idx]
+            batch_event_locations = event_locations[batch_idx]
+            batch_mu = mu[batch_idx]
+            batch_alpha = alpha[batch_idx]
+            batch_beta = beta[batch_idx]
+            batch_gamma = gamma[batch_idx]
 
-    # Create the positional encoding layers
-    src_pos = PositionEncoding(d_model, src_seq_len, dropout)
-    tgt_pos = PositionEncoding(d_model, tgt_seq_len, dropout)
-    
-    # Create the encoder blocks
-    encoder_blocks = []
-    for _ in range(N):
-        encoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
-        feed_forward_block = FeedForward(d_model, d_ff, dropout)
-        encoder_block = EncoderBlock(d_model, encoder_self_attention_block, feed_forward_block, dropout)
-        encoder_blocks.append(encoder_block)
+            for i in range(len(batch_event_times)):
+                point_time = batch_event_times[i]
+                point_location = batch_event_locations[i]
+                
+                # Calculate intensity at the event point
+                intensity = hawkes_intensity_at_point(
+                    batch_event_times[:i], batch_event_locations[:i], 
+                    batch_mu, batch_alpha, batch_beta, batch_gamma, 
+                    point_time, point_location
+                )
+                log_intensity_sum += torch.log(intensity + eps)
+            
+            # Calculate integrated intensity over the observation window
+            T = batch_event_times[-1]
+            x_min, x_max = batch_event_locations[:, 0].min(), batch_event_locations[:, 0].max()
+            y_min, y_max = batch_event_locations[:, 1].min(), batch_event_locations[:, 1].max()
+            
+            time_grid = torch.arange(0, T, dt)
+            x_grid = torch.arange(x_min, x_max, dx)
+            y_grid = torch.arange(y_min, y_max, dy)
+            
+            for t in time_grid:
+                for x in x_grid:
+                    for y in y_grid:
+                        point_time = t
+                        point_location = torch.tensor([x, y], dtype=batch_event_locations.dtype)
+                        intensity = hawkes_intensity_at_point(
+                            batch_event_times, batch_event_locations, 
+                            batch_mu, batch_alpha, batch_beta, batch_gamma, 
+                            point_time, point_location
+                        )
+                        integrated_intensity_sum += intensity * dt * dx * dy
+        
+        log_likelihood_value = log_intensity_sum - integrated_intensity_sum
+        return log_likelihood_value / event_times.shape[0]
 
-    # Create the decoder blocks
-    decoder_blocks = []
-    for _ in range(N):
-        decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
-        decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
-        feed_forward_block = FeedForward(d_model, d_ff, dropout)
-        decoder_block = DecoderBlock(d_model, decoder_self_attention_block, decoder_cross_attention_block, feed_forward_block, dropout)
-        decoder_blocks.append(decoder_block)
-    
-    # Create the encoder and decoder
-    encoder = Encoder(d_model, nn.ModuleList(encoder_blocks))
-    decoder = Decoder(d_model, nn.ModuleList(decoder_blocks))
-    
-    # Create the projection layer
-    projection_layer = ProjectionLayer(d_model, tgt_input_dim)
-    
-    # Create the transformer
-    transformer = Transformer(encoder, decoder, src_embed, tgt_embed, src_pos, tgt_pos, projection_layer, d_model)
-    
-    # Initialize the parameters
-    for p in transformer.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_uniform_(p)
-    
-    return transformer
+
