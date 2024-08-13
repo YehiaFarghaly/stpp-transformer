@@ -10,7 +10,6 @@ from tqdm.auto import tqdm
     
 def hawkes_intensity_at_point(event_times, event_locations, mu, alpha, beta, gamma, point_time, point_location):
     base_intensity = mu
-
     # Compute temporal excitation
     time_diffs = point_time - event_times
     excitation_temporal = alpha * torch.exp(-beta * time_diffs)
@@ -44,101 +43,93 @@ def calculate_upper_bound(event_times, event_locations, mu, alpha, beta, gamma, 
 
     return max_intensity
 
-# Function to generate events using thinning
-import torch
-import torch.distributions
 
 def generate_event_thinning(event_data, T, model, spatial_range):
     batch_size = event_data.shape[0]
     all_predicted_events = []
     all_rejected_events = []
+
     for i in range(batch_size):
         # Extract event times and locations
         current_time = event_data[i, -1, -1].item()
-        current_location = event_data[i, -1, :-1]
         times = event_data[i, :, -1].tolist()
         locations = event_data[i, :, :-1].tolist()
 
         predicted_events = []
         rejected_events = []
 
-        accepted_event = False
-
         # Predict Hawkes process parameters using the model
         mu, alpha, beta, gamma = model(event_data[i].unsqueeze(0), None)
-        # print('mu: ', mu, " alpha: ", alpha, " beta: ", beta, "gamma: ", gamma)
         # Flatten the parameters
         mu = mu.squeeze().item()
         alpha = alpha.squeeze().item()
         beta = beta.squeeze().item()
         gamma = gamma.squeeze().item()
-        # print('inside batch number ', i)
-        # print('mu = ', mu)
-        # print('alpha = ', alpha)
-        # print('beta = ', beta)
-        # print('gamma = ', gamma)
+        mu =  0.008582075242884457
+        alpha = 0.829000473022461   
+        beta =  3.209417991456576e-01   
+        gamma=  6.258946418762207
 
         # Calculate upper bound
         upper_bound = calculate_upper_bound(
             event_data[i, :, -1], event_data[i, :, :-1],
             mu, alpha, beta, gamma, T[i].item(),
-            [
-                event_data[i, :, 0].min(), event_data[i, :, 0].max(),
-                event_data[i, :, 1].min(), event_data[i, :, 1].max()
-            ]
+            spatial_range
         )
         
-        upper_bound = upper_bound * 2
-        while not accepted_event:
-            # print('upper bound = ', upper_bound)
-            # print('yea the infinite loop is here no accepted event :(')
+        while current_time < T[i].item():
             inter_event_time = torch.distributions.Exponential(upper_bound).sample().item()
+            inter_event_time = inter_event_time * 3
             candidate_time = current_time + inter_event_time
             if candidate_time > T[i].item():
                 break
 
             # Generate candidate location using uniform distribution
-            candidate_location = torch.distributions.Uniform(
-                current_location - spatial_range / 2,
-                current_location + spatial_range / 2
-            ).sample().squeeze(0)
-
-            # Pass the parameters here
+            candidate_location = torch.tensor([
+                torch.distributions.Uniform(spatial_range[0], spatial_range[1]).sample().item(),
+                torch.distributions.Uniform(spatial_range[2], spatial_range[3]).sample().item()
+            ])
+            # print('the event_data: ', event_data[i, :, -1].shape)
+            print('mu: alpha beta gamma: ', mu, alpha, beta, gamma)
+            # print('candidate location: ', candidate_location)
+            # print('candidate time: ', candidate_time)
+            # Calculate the intensity at the candidate point
             candidate_intensity = hawkes_intensity_at_point(
                 event_data[i, :, -1], event_data[i, :, :-1],
                 mu, alpha, beta, gamma, candidate_time, candidate_location
             )
-            # print('candidate time: ', candidate_time)
-            # print('candidate location: ', candidate_location)
-            # print('candidate intensity: ', candidate_intensity)
 
             acceptance_prob = candidate_intensity / upper_bound
             
             if torch.rand(1).item() < acceptance_prob:
-                predicted_events.append(torch.cat([candidate_location, torch.tensor([candidate_time])]))
+                predicted_events.append(torch.cat([candidate_location, torch.tensor([candidate_time]), torch.tensor([candidate_intensity])]))
                 current_time = candidate_time
                 current_location = candidate_location
-                accepted_event = True
             else:
-                rejected_events.append(torch.cat([candidate_location, torch.tensor([candidate_time])]))
+                rejected_events.append(torch.cat([candidate_location, torch.tensor([candidate_time]), torch.tensor([candidate_intensity])]))
 
-        if len(predicted_events) == 0:
-            candidate_time = current_time + torch.distributions.Exponential(upper_bound).sample().item()
-            candidate_location = torch.distributions.Uniform(
-                current_location - spatial_range / 2,
-                current_location + spatial_range / 2
-            ).sample().squeeze(0)
-            predicted_events.append(torch.cat([candidate_location, torch.tensor([candidate_time])]))
-            current_time = candidate_time
-            current_location = candidate_location
-            times.append(candidate_time)
-            locations.append(candidate_location.tolist())
+        # if len(predicted_events) == 0:
+        #     candidate_time = current_time + torch.distributions.Exponential(upper_bound).sample().item()
+        #     candidate_location = torch.tensor([
+        #         torch.distributions.Uniform(spatial_range[0], spatial_range[1]).sample().item(),
+        #         torch.distributions.Uniform(spatial_range[2], spatial_range[3]).sample().item()
+        #     ])
+        #     candidate_intensity = hawkes_intensity_at_point(
+        #         event_data[i, :, -1], event_data[i, :, :-1],
+        #         mu, alpha, beta, gamma, candidate_time, candidate_location
+        #     )
+        #     predicted_events.append(torch.cat([candidate_location, torch.tensor([candidate_time]), torch.tensor([candidate_intensity])]))
+        #     current_time = candidate_time
+        #     current_location = candidate_location
+        #     times.append(candidate_time)
+        #     locations.append(candidate_location.tolist())
 
         all_predicted_events.append(torch.stack(predicted_events))
         if rejected_events:
             all_rejected_events.append(torch.stack(rejected_events))
 
     return all_predicted_events, all_rejected_events
+
 
 
 class InputEmbedding(nn.Module):
@@ -296,12 +287,18 @@ class Decoder(nn.Module):
         self.fc_beta = nn.Linear(d_model, latent_dim)
         self.fc_gamma = nn.Linear(d_model, latent_dim)
         
+        nn.init.xavier_uniform_(self.fc_mu.weight)
+        nn.init.xavier_uniform_(self.fc_alpha.weight)
+        nn.init.xavier_uniform_(self.fc_beta.weight)
+        nn.init.xavier_uniform_(self.fc_gamma.weight)
+    
     def forward(self, x, src_mask):
         mu = F.softplus(self.fc_mu(x.mean(dim=1)))
         alpha = F.softplus(self.fc_alpha(x.mean(dim=1)))
         beta = F.softplus(self.fc_beta(x.mean(dim=1)))
         gamma = F.softplus(self.fc_gamma(x.mean(dim=1)))
         return mu, alpha, beta, gamma
+
 
 class Transformer(nn.Module):
     def __init__(self, input_dim: int, d_model: int, N: int, h: int, d_ff: int, dropout: float, seq_len: int, latent_dim: int):
@@ -315,32 +312,37 @@ class Transformer(nn.Module):
         return mu, alpha, beta, gamma
     
 
-    def log_likelihood(self, event_times, event_locations, mu, alpha, beta, gamma, dt=0.1, dx=0.1, dy=0.1):        
+    def log_likelihood(self, event_times, event_locations, mu, alpha, beta, gamma, target_times, target_locations, dt=0.1, dx=0.1, dy=0.1):
         log_intensity_sum = 0
         integrated_intensity_sum = 0
         eps = 1e-9  # Small value to prevent log(0)
-        for batch_idx in range(event_times.shape[0]):
+        
+        for batch_idx in range(target_times.shape[0]):
             batch_event_times = event_times[batch_idx]
             batch_event_locations = event_locations[batch_idx]
             batch_mu = mu[batch_idx]
             batch_alpha = alpha[batch_idx]
             batch_beta = beta[batch_idx]
             batch_gamma = gamma[batch_idx]
+            
+            # Target events
+            batch_target_times = target_times[batch_idx]
+            batch_target_locations = target_locations[batch_idx]
 
-            for i in range(len(batch_event_times)):
-                point_time = batch_event_times[i]
-                point_location = batch_event_locations[i]
+            for i in range(len(batch_target_times)):
+                point_time = batch_target_times[i]
+                point_location = batch_target_locations[i]
                 
                 # Calculate intensity at the event point
                 intensity = hawkes_intensity_at_point(
-                    batch_event_times[:i], batch_event_locations[:i], 
+                    batch_event_times, batch_event_locations,
                     batch_mu, batch_alpha, batch_beta, batch_gamma, 
                     point_time, point_location
                 )
                 log_intensity_sum += torch.log(intensity + eps)
-            
+
             # Calculate integrated intensity over the observation window
-            T = batch_event_times[-1]
+            T = batch_target_times[-1]
             x_min, x_max = batch_event_locations[:, 0].min(), batch_event_locations[:, 0].max()
             y_min, y_max = batch_event_locations[:, 1].min(), batch_event_locations[:, 1].max()
             
@@ -354,13 +356,11 @@ class Transformer(nn.Module):
                         point_time = t
                         point_location = torch.tensor([x, y], dtype=batch_event_locations.dtype)
                         intensity = hawkes_intensity_at_point(
-                            batch_event_times, batch_event_locations, 
+                            batch_event_times, batch_event_locations,
                             batch_mu, batch_alpha, batch_beta, batch_gamma, 
                             point_time, point_location
                         )
                         integrated_intensity_sum += intensity * dt * dx * dy
         
         log_likelihood_value = log_intensity_sum - integrated_intensity_sum
-        return log_likelihood_value / event_times.shape[0]
-
-
+        return log_likelihood_value / target_times.shape[0]

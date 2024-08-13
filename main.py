@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
-from model import Transformer
+from model_dynamic import Transformer
 import pandas as pd
 import torch
 
@@ -13,18 +13,28 @@ class NYPDSpatiotemporalDataset(Dataset):
         self.data = pd.read_csv(csv_file)
         self.seq_len = seq_len + 1
         self.data = self.data.dropna(subset=['LATITUDE', 'LONGITUDE', 'DATE', 'TIME'])
+        
+
 
         # Combine date and time into a single datetime column and convert to timestamp
         self.data['DATETIME'] = pd.to_datetime(self.data['DATE'] + ' ' + self.data['TIME'])
         self.data['TIMESTAMP'] = self.data['DATETIME'].apply(lambda x: x.timestamp())
 
+        self.data = self.data.sort_values(by='TIMESTAMP')
         # Normalize the timestamps using min-max normalization
         min_timestamp = self.data['TIMESTAMP'].min()
         max_timestamp = self.data['TIMESTAMP'].max()
         self.data['TIMESTAMP'] = (self.data['TIMESTAMP'] - min_timestamp) / (max_timestamp - min_timestamp)
 
+        lat_min, lat_max = self.data['LATITUDE'].min(), self.data['LATITUDE'].max()
+        lon_min, lon_max = self.data['LONGITUDE'].min(), self.data['LONGITUDE'].max()
+        self.data['LATITUDE'] = (self.data['LATITUDE'] - lat_min) / (lat_max - lat_min)
+        self.data['LONGITUDE'] = (self.data['LONGITUDE'] - lon_min) / (lon_max - lon_min)
+
+
         # Select relevant columns
         self.data = self.data[['LATITUDE', 'LONGITUDE', 'TIMESTAMP']]
+
 
     def __len__(self):
         return len(self.data) - self.seq_len
@@ -64,13 +74,14 @@ dropout = 0.1
 d_ff = 2048
 epochs = 100  # Increase the number of epochs
 learning_rate = 0.001
-patience = 10  # Early stopping patience
+patience = 5  # Early stopping patience
 latent_dim = 1
 
 model = Transformer(src_input_dim, d_model, N, h, d_ff, dropout, src_seq_len, latent_dim)
 
 # Define the optimizer
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
 
 # Training loop with early stopping
 best_val_loss = float('inf')
@@ -82,22 +93,26 @@ for epoch in range(epochs):
     for inputs, targets in train_dataloader:
         optimizer.zero_grad()
         src_mask = None
+
         # Set T to the maximum time in the current batch
         T = targets[:, -1]
+
         # Forward pass
         mu, alpha, beta, gamma = model(inputs, src_mask)
-        # print('results of the prediction mu, alpha, beta, gamma: ', mu, alpha, beta, gamma)
+
         # Compute log likelihood loss
-        event_times = inputs[:, :, -1]  # Assuming time is the last feature in input
-        event_locations = inputs[:, :, :-1]  # Assuming the rest are locations
-        log_likelihood_loss = -model.log_likelihood(event_times, event_locations, mu, alpha, beta, gamma).mean()
+        event_times = inputs[:, :, -1]
+        event_locations = inputs[:, :, :-1]
+        target_times = targets[:, -1].unsqueeze(1)
+        target_locations = targets[:, :-1].unsqueeze(1)
+        log_likelihood_loss = -model.log_likelihood(event_times, event_locations, mu, alpha, beta, gamma, target_times, target_locations).mean()
         loss = log_likelihood_loss
-        
+
         loss.backward()
         optimizer.step()
-        
+
         running_loss += loss.item()
-    
+
     avg_train_loss = running_loss / len(train_dataloader)
 
     # Validate the model
@@ -106,28 +121,31 @@ for epoch in range(epochs):
     with torch.no_grad():
         for inputs, targets in val_dataloader:
             src_mask = None
-            
+
             # Set T to the maximum time in the current batch
             T = targets[:, -1]
-            
+
             # Forward pass
             mu, alpha, beta, gamma = model(inputs, src_mask)
             
             # Compute log likelihood loss
             event_times = inputs[:, :, -1]
             event_locations = inputs[:, :, :-1]
-            log_likelihood_loss = -model.log_likelihood(event_times, event_locations, mu, alpha, beta, gamma).mean()
+            target_times = targets[:, -1].unsqueeze(1)
+            target_locations = targets[:, :-1].unsqueeze(1)
+            log_likelihood_loss = -model.log_likelihood(event_times, event_locations, mu, alpha, beta, gamma, target_times, target_locations).mean()
             loss = log_likelihood_loss
             val_loss += loss.item()
-    
+
     avg_val_loss = val_loss / len(val_dataloader)
-    
     print(f"Epoch {epoch+1}/{epochs}, Training Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}")
+
+    scheduler.step(avg_val_loss)
 
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
         patience_counter = 0
-        torch.save(model.state_dict(), 'best_transformer_model.pth')
+        torch.save(model.state_dict(), 'best_transformer_model_dynamic.pth')
     else:
         patience_counter += 1
 
@@ -135,5 +153,5 @@ for epoch in range(epochs):
         print("Early stopping triggered")
         break
 
-model.load_state_dict(torch.load('best_transformer_model.pth'))
+model.load_state_dict(torch.load('best_transformer_model_dynamic.pth'))
 model.eval()

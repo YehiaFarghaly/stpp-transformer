@@ -1,133 +1,66 @@
-import pandas as pd
-import torch
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-import numpy as np
 from mpl_toolkits.mplot3d import Axes3D
-from matplotlib import cm
-from scipy.interpolate import griddata
-from model import build_transformer
+import numpy as np
+from tqdm import tqdm
+import matplotlib.animation as animation
 
-# Initialize model parameters
-src_input_dim = 3
-tgt_input_dim = 3
-src_seq_len = 10
-tgt_seq_len = 1
-d_model = 512
-N = 6
-h = 8
-dropout = 0.1
-d_ff = 2048
+def plot_lambst_static(intensities, accepted_events, rejected_events, x_range, y_range, t_range, fps, 
+                         cmap='magma', fn='result.mp4'):        
+    cmin = 0
+    cmax = np.max(intensities)
+        
+    cmid = cmin + (cmax - cmin) * 0.9    
+        
+    print(f'Inferred cmax: {cmax}')
+        
+    grid_x, grid_y = np.meshgrid(x_range, y_range)
+    frn = len(t_range)  # frame number of the animation
 
-# Load model
-model = build_transformer(src_input_dim, tgt_input_dim, src_seq_len, tgt_seq_len, d_model, N, h, dropout, d_ff)
-model.load_state_dict(torch.load('best_transformer_model.pth'))
-print('model loaded')
-model.eval()
-
-# Example events data
-example_events = pd.DataFrame({
-    'x': [37.45401188, 95.07143064, 73.19939418, 59.86584842, 15.60186404, 15.59945203, 5.808361217, 86.61761458, 60.11150117, 70.80725778],
-    'y': [18.51329288, 54.19009474, 87.29458359, 73.22248864, 80.65611479, 65.87833667, 69.22765645, 84.91956516, 24.96680089, 48.94249636],
-    'time': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-})
-
-# Convert to tensor
-example_tensor = torch.tensor(example_events.values, dtype=torch.float32).unsqueeze(0)
-time_tensor = torch.tensor([8, 9, 10, 7, 8, 7.6, 8.4, 6.9, 9.6, 10])
-# Model prediction
-with torch.no_grad():
-    src_mask = None
-    tgt_mask = None
-    print('inside the loop')
-    predictions, z = model(example_tensor, src_mask, time_tensor)
-print('predictions = ', predictions)
-predictions_np = predictions.numpy()
-predictions_df = pd.DataFrame(predictions_np, columns=['x', 'y', 'time'])
-
-# Get the intensity function values
-event_times = torch.tensor(example_events['time'].values, dtype=torch.float32).unsqueeze(0)
-event_locations = torch.tensor(example_events[['x', 'y']].values, dtype=torch.float32).unsqueeze(0)
-predicted_time = torch.tensor(predictions_df['time'].values, dtype=torch.float32)
-predicted_location = torch.tensor(predictions_df[['x', 'y']].values, dtype=torch.float32)
-
-print('predicted: ', predictions_df )
-with torch.no_grad():
-    input_intensity = model.intensity_function(z, event_times, event_locations).squeeze().numpy()
-    predicted_intensity = model.intensity_function.single_event_intensity(z, event_times, event_locations, predicted_time, predicted_location).squeeze().numpy()
-    print('inten: ', predicted_intensity)
-intensity_df = pd.DataFrame({
-    'x': example_events['x'].tolist() + predictions_df['x'].tolist(),
-    'y': example_events['y'].tolist() + predictions_df['y'].tolist(),
-    'intensity': input_intensity.tolist() + [predicted_intensity],
-    'time': example_events['time'].tolist() + predictions_df['time'].tolist(),
-    'type': ['input'] * len(example_events) + ['predicted'] * len(predictions_df)
-})
-
-print(intensity_df)
-
-# Define a grid for x and y
-x = np.linspace(min(intensity_df['x']), max(intensity_df['x']), 100)
-y = np.linspace(min(intensity_df['y']), max(intensity_df['y']), 100)
-x_grid, y_grid = np.meshgrid(x, y)
-
-# Create 3D plot
-fig = plt.figure()
-ax = fig.add_subplot(111, projection='3d')
-
-ax.set_xlim(min(intensity_df['x']), max(intensity_df['x']))
-ax.set_ylim(min(intensity_df['y']), max(intensity_df['y']))
-ax.set_zlim(0, 0.5)
-ax.set_xlabel('X')
-ax.set_ylabel('Y')
-ax.set_zlabel('Intensity')
-plt.title('Spatio-temporal Conditional Intensity')
-
-# Initialize scatter plots
-input_scatter = ax.scatter([], [], [], c='blue', label='Input Events')
-predicted_scatter = ax.scatter([], [], [], c='red', label='Predicted Events')
-
-# Animation update function
-def update(frame):
-    current_time = frame * time_step
-    ax.clear()
-
-    # Interpolate intensity values over the grid
-    current_intensity_df = intensity_df[intensity_df['time'] <= current_time]
-    decay_factor = np.exp(-0.2 * (current_time - intensity_df['time']))
-    decayed_intensity = intensity_df['intensity'] * decay_factor
-    if len(current_intensity_df) >= 3:
-        z = griddata(
-            (current_intensity_df['x'], current_intensity_df['y']),
-            decayed_intensity[intensity_df['time'] <= current_time],
-            (x_grid, y_grid),
-            method='cubic',
-            fill_value=0
-        )
-        ax.plot_surface(x_grid, y_grid, z, cmap=cm.viridis, alpha=0.6)
+    fig = plt.figure(figsize=(6,6), dpi=150)
+    ax = fig.add_subplot(111, projection='3d', xlabel='x', ylabel='y', zlabel='λ', zlim=(cmin, cmax), 
+                         title='Spatio-temporal Conditional Intensity')
+    ax.title.set_position([.5, .95])
+    ax.set_xlim(min(x_range), max(x_range))  # Explicitly set x-axis limits
+    ax.set_ylim(min(y_range), max(y_range))
+    ax.set_zlim(cmin, cmax)
+    text = ax.text(min(x_range), min(y_range), cmax, "t={:.2f}".format(t_range[0]), fontsize=10)
+    plot = [ax.plot_surface(grid_x, grid_y, intensities[0], rstride=1, cstride=1, cmap=cmap)]
     
-    # Update scatter plots
-    input_data = intensity_df[(intensity_df['type'] == 'input') & (intensity_df['time'] <= current_time)]
-    predicted_data = intensity_df[(intensity_df['type'] == 'predicted') & (intensity_df['time'] <= current_time)]
-    input_scatter._offsets3d = (input_data['x'].values, input_data['y'].values, input_data['intensity'].values)
-    predicted_scatter._offsets3d = (predicted_data['x'].values, predicted_data['y'].values, predicted_data['intensity'].values)
+    zs = np.ones_like(intensities[0]) * cmid # add a platform for locations
+    plat = ax.plot_surface(grid_x, grid_y, zs, rstride=1, cstride=1, color='white', alpha=0.2)
+    accepted_points = ax.scatter3D([], [], [], color='green', label='Accepted') # add locations for accepted events
+    rejected_points = ax.scatter3D([], [], [], color='red', label='Rejected') # add locations for rejected events
+    plot.append(plat)
+    plot.append(accepted_points)
+    plot.append(rejected_points)    
     
-    ax.scatter(input_data['x'].values, input_data['y'].values, input_data['intensity'].values, c='blue', label='Input Events')
-    ax.scatter(predicted_data['x'].values, predicted_data['y'].values, predicted_data['intensity'].values, c='red', label='Predicted Events')
+    pbar = tqdm(total=frn + 2)
     
-    ax.set_xlim(min(intensity_df['x']), max(intensity_df['x']))
-    ax.set_ylim(min(intensity_df['y']), max(intensity_df['y']))
-    ax.set_zlim(0, max(intensity_df['intensity'] + 0.2))
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Intensity')
-    plt.title('Spatio-temporal Conditional Intensity')
-    ax.text2D(0.05, 0.95, f"t={current_time:.2f}", transform=ax.transAxes)
-
-# Set up animation
-max_time = max(intensity_df['time']) + 1
-time_step = 0.1
-ani = animation.FuncAnimation(fig, update, frames=range(int(max_time / time_step) + 1), interval=100, blit=False, repeat=True)
-
-plt.legend()
-plt.show()
+    def update_plot(frame_number):
+        t = t_range[frame_number]
+        plot[0].remove()
+        plot[0] = ax.plot_surface(grid_x, grid_y, intensities[frame_number], rstride=1, cstride=1, cmap='magma')
+        text.set_text('t={:.2f}'.format(t))
+                
+        # Update the scatter plots for accepted and rejected events
+        accepted_locs = np.array([event[:2] for event in accepted_events if event[2] <= t])
+        rejected_locs = np.array([event[:2] for event in rejected_events if event[2] <= t])
+        
+        if accepted_locs.size > 0:
+            zs = np.ones_like(accepted_locs[:, 0]) * cmid
+            plot[2].remove()
+            plot[2] = ax.scatter3D(accepted_locs[:, 0], accepted_locs[:, 1], zs, color='green', s=10, label='Accepted')
+        
+        if rejected_locs.size > 0:
+            zs = np.ones_like(rejected_locs[:, 0]) * cmid
+            plot[3].remove()
+            plot[3] = ax.scatter3D(rejected_locs[:, 0], rejected_locs[:, 1], zs, color='red', s=10, label='Rejected')
+        
+        ax.set_xlim(min(x_range), max(x_range))  # Reset x-axis limits
+        ax.set_ylim(min(y_range), max(y_range))
+        ax.set_zlim(cmin, cmax)
+        pbar.update()
+    
+    ani = animation.FuncAnimation(fig, update_plot, frn, interval=1000/fps)
+    ani.save(fn, writer='ffmpeg', fps=fps)
+    return ani
