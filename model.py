@@ -1,8 +1,9 @@
 import math
 import numpy as np
-
+from sklearn.neighbors import KernelDensity
 import torch
 from torch import nn
+from kan import KAN
 from torch.nn import functional as F
 import torch.distributions as D
 from tqdm.auto import tqdm
@@ -44,31 +45,45 @@ def calculate_upper_bound(event_times, event_locations, mu, alpha, beta, gamma, 
     return max_intensity
 
 
-def generate_event_thinning(event_data, T, model, spatial_range):
+def kde_sample(event_locations, bandwidth=0.1, spatial_range=[-1.5, 1.5, -1.5, 1.5], n_samples=1):
+    kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth)
+    kde.fit(event_locations.numpy())
+    samples = kde.sample(n_samples)
+    samples = np.clip(samples, [spatial_range[0], spatial_range[2]], [spatial_range[1], spatial_range[3]])
+    return torch.tensor(samples)
+
+def generate_event_thinning(event_data, T, model, spatial_range, kde_bandwidth=0.1):
     batch_size = event_data.shape[0]
     all_predicted_events = []
     all_rejected_events = []
+    mu_values = []
+    alpha_values = []
+    beta_values = []
+    gamma_values = []
 
     for i in range(batch_size):
         # Extract event times and locations
         current_time = event_data[i, -1, -1].item()
         times = event_data[i, :, -1].tolist()
         locations = event_data[i, :, :-1].tolist()
-
+        
         predicted_events = []
         rejected_events = []
 
         # Predict Hawkes process parameters using the model
         mu, alpha, beta, gamma = model(event_data[i].unsqueeze(0), None)
-        # Flatten the parameters
         mu = mu.squeeze().item()
         alpha = alpha.squeeze().item()
         beta = beta.squeeze().item()
         gamma = gamma.squeeze().item()
-        mu =  0.008582075242884457
-        alpha = 0.829000473022461   
-        beta =  3.209417991456576e-01   
-        gamma=  6.258946418762207
+        # mu = 0.1
+        # alpha = 0.5
+        # beta = 1.5
+        # gamma = 1
+        mu_values.append(mu)
+        alpha_values.append(alpha)
+        beta_values.append(beta)
+        gamma_values.append(gamma)
 
         # Calculate upper bound
         upper_bound = calculate_upper_bound(
@@ -76,23 +91,19 @@ def generate_event_thinning(event_data, T, model, spatial_range):
             mu, alpha, beta, gamma, T[i].item(),
             spatial_range
         )
-        
+
         while current_time < T[i].item():
+            print('T[i] = ', T[i])
+            print('current_time: ', current_time)
             inter_event_time = torch.distributions.Exponential(upper_bound).sample().item()
-            inter_event_time = inter_event_time * 3
             candidate_time = current_time + inter_event_time
             if candidate_time > T[i].item():
                 break
 
-            # Generate candidate location using uniform distribution
-            candidate_location = torch.tensor([
-                torch.distributions.Uniform(spatial_range[0], spatial_range[1]).sample().item(),
-                torch.distributions.Uniform(spatial_range[2], spatial_range[3]).sample().item()
-            ])
-            # print('the event_data: ', event_data[i, :, -1].shape)
-            print('mu: alpha beta gamma: ', mu, alpha, beta, gamma)
-            # print('candidate location: ', candidate_location)
-            # print('candidate time: ', candidate_time)
+            # Generate candidate location using KDE sampling
+            candidate_location = kde_sample(torch.tensor(locations), bandwidth=kde_bandwidth, spatial_range=spatial_range, n_samples=1).squeeze()
+
+            print('candidate location: ', candidate_location)
             # Calculate the intensity at the candidate point
             candidate_intensity = hawkes_intensity_at_point(
                 event_data[i, :, -1], event_data[i, :, :-1],
@@ -101,36 +112,31 @@ def generate_event_thinning(event_data, T, model, spatial_range):
 
             acceptance_prob = candidate_intensity / upper_bound
             
-            if torch.rand(1).item() < acceptance_prob:
-                predicted_events.append(torch.cat([candidate_location, torch.tensor([candidate_time]), torch.tensor([candidate_intensity])]))
-                current_time = candidate_time
-                current_location = candidate_location
-            else:
-                rejected_events.append(torch.cat([candidate_location, torch.tensor([candidate_time]), torch.tensor([candidate_intensity])]))
 
-        # if len(predicted_events) == 0:
-        #     candidate_time = current_time + torch.distributions.Exponential(upper_bound).sample().item()
-        #     candidate_location = torch.tensor([
-        #         torch.distributions.Uniform(spatial_range[0], spatial_range[1]).sample().item(),
-        #         torch.distributions.Uniform(spatial_range[2], spatial_range[3]).sample().item()
-        #     ])
-        #     candidate_intensity = hawkes_intensity_at_point(
-        #         event_data[i, :, -1], event_data[i, :, :-1],
-        #         mu, alpha, beta, gamma, candidate_time, candidate_location
-        #     )
-        #     predicted_events.append(torch.cat([candidate_location, torch.tensor([candidate_time]), torch.tensor([candidate_intensity])]))
-        #     current_time = candidate_time
-        #     current_location = candidate_location
-        #     times.append(candidate_time)
-        #     locations.append(candidate_location.tolist())
+            if torch.rand(1).item() < acceptance_prob:
+                predicted_events.append(torch.cat([candidate_location, torch.tensor([current_time + i*68 ]), torch.tensor([candidate_intensity])]))
+                current_time = candidate_time
+            else:
+                rejected_events.append(torch.cat([candidate_location, torch.tensor([current_time + i*68 ]), torch.tensor([candidate_intensity])]))
+                current_time = candidate_time
+
+        if len(predicted_events) == 0:
+            candidate_time = current_time + torch.distributions.Exponential(upper_bound).sample().item()
+            candidate_location = kde_sample(torch.tensor(locations), bandwidth=kde_bandwidth, spatial_range=spatial_range, n_samples=1).squeeze()
+            candidate_intensity = hawkes_intensity_at_point(
+                event_data[i, :, -1], event_data[i, :, :-1],
+                mu, alpha, beta, gamma, candidate_time, candidate_location
+            )
+            predicted_events.append(torch.cat([candidate_location, torch.tensor([candidate_time + i*68 ]), torch.tensor([candidate_intensity])]))
+            current_time = candidate_time
+            times.append(candidate_time)
+            locations.append(candidate_location.tolist())
 
         all_predicted_events.append(torch.stack(predicted_events))
         if rejected_events:
             all_rejected_events.append(torch.stack(rejected_events))
 
-    return all_predicted_events, all_rejected_events
-
-
+    return all_predicted_events, all_rejected_events, mu_values, alpha_values, beta_values, gamma_values
 
 class InputEmbedding(nn.Module):
     def __init__(self, d_model, input_dim):
@@ -313,6 +319,88 @@ class Transformer(nn.Module):
     
 
     def log_likelihood(self, event_times, event_locations, mu, alpha, beta, gamma, target_times, target_locations, dt=0.1, dx=0.1, dy=0.1):
+        log_intensity_sum = 0
+        integrated_intensity_sum = 0
+        eps = 1e-9  # Small value to prevent log(0)
+        
+        for batch_idx in range(target_times.shape[0]):
+            batch_event_times = event_times[batch_idx]
+            batch_event_locations = event_locations[batch_idx]
+            batch_mu = mu[batch_idx]
+            batch_alpha = alpha[batch_idx]
+            batch_beta = beta[batch_idx]
+            batch_gamma = gamma[batch_idx]
+            
+            # Target events
+            batch_target_times = target_times[batch_idx]
+            batch_target_locations = target_locations[batch_idx]
+
+            for i in range(len(batch_target_times)):
+                point_time = batch_target_times[i]
+                point_location = batch_target_locations[i]
+                
+                # Calculate intensity at the event point
+                intensity = hawkes_intensity_at_point(
+                    batch_event_times, batch_event_locations,
+                    batch_mu, batch_alpha, batch_beta, batch_gamma, 
+                    point_time, point_location
+                )
+                log_intensity_sum += torch.log(intensity + eps)
+
+            # Calculate integrated intensity over the observation window
+            T = batch_target_times[-1]
+            x_min, x_max = batch_event_locations[:, 0].min(), batch_event_locations[:, 0].max()
+            y_min, y_max = batch_event_locations[:, 1].min(), batch_event_locations[:, 1].max()
+            
+            time_grid = torch.arange(0, T, dt)
+            x_grid = torch.arange(x_min, x_max, dx)
+            y_grid = torch.arange(y_min, y_max, dy)
+            
+            for t in time_grid:
+                for x in x_grid:
+                    for y in y_grid:
+                        point_time = t
+                        point_location = torch.tensor([x, y], dtype=batch_event_locations.dtype)
+                        intensity = hawkes_intensity_at_point(
+                            batch_event_times, batch_event_locations,
+                            batch_mu, batch_alpha, batch_beta, batch_gamma, 
+                            point_time, point_location
+                        )
+                        integrated_intensity_sum += intensity * dt * dx * dy
+        
+        log_likelihood_value = log_intensity_sum - integrated_intensity_sum
+        return log_likelihood_value / target_times.shape[0]
+
+class KANDecoder(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, kan_layers: int):
+        super(KANDecoder, self).__init__()
+        # Define the KAN model
+        # width is a list of layer sizes, so we can base it on the input_dim, kan_layers, and output_dim
+        # grid, k, and seed are hyperparameters you can tune based on your specific task
+        self.kan = KAN(width=[input_dim, kan_layers, output_dim, output_dim], grid=5, k=3, seed=0)
+        
+    def forward(self, x):
+        # KAN expects a 2D tensor: (batch_size, input_dim)
+        x_flat = x.mean(dim=1)  # Reduce the sequence dimension
+        params = F.softplus(self.kan(x_flat))  # Apply softplus to ensure positivity
+        mu, alpha, beta, gamma = torch.chunk(params, 4, dim=-1)
+        return mu.squeeze(-1), alpha.squeeze(-1), beta.squeeze(-1), gamma.squeeze(-1)
+
+
+# Replace the decoder in the Transformer model with KANDecoder
+class KANTransformer(nn.Module):
+    def __init__(self, input_dim: int, d_model: int, N: int, h: int, d_ff: int, dropout: float, seq_len: int, latent_dim: int, kan_layers: int):
+        super().__init__()
+        self.encoder = Encoder(input_dim, d_model, N, h, d_ff, dropout, seq_len)
+        self.decoder = KANDecoder(d_model, latent_dim * 4, kan_layers)  # latent_dim * 4 because we have 4 outputs (mu, alpha, beta, gamma)
+
+    def forward(self, src, src_mask):
+        enc_output = self.encoder(src, src_mask)
+        mu, alpha, beta, gamma = self.decoder(enc_output)
+        return mu, alpha, beta, gamma
+     
+
+    def log_likelihood(self, event_times, event_locations, mu, alpha, beta, gamma, target_times, target_locations, dt=0.05, dx=0.05, dy=0.05):
         log_intensity_sum = 0
         integrated_intensity_sum = 0
         eps = 1e-9  # Small value to prevent log(0)

@@ -1,57 +1,11 @@
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
-from model_dynamic import Transformer
+from model import Transformer
 import pandas as pd
 import torch
-
-
-class NYPDSpatiotemporalDataset(Dataset):
-    def __init__(self, csv_file, seq_len):
-        self.data = pd.read_csv(csv_file)
-        self.seq_len = seq_len + 1
-        self.data = self.data.dropna(subset=['LATITUDE', 'LONGITUDE', 'DATE', 'TIME'])
-        
-
-
-        # Combine date and time into a single datetime column and convert to timestamp
-        self.data['DATETIME'] = pd.to_datetime(self.data['DATE'] + ' ' + self.data['TIME'])
-        self.data['TIMESTAMP'] = self.data['DATETIME'].apply(lambda x: x.timestamp())
-
-        self.data = self.data.sort_values(by='TIMESTAMP')
-        # Normalize the timestamps using min-max normalization
-        min_timestamp = self.data['TIMESTAMP'].min()
-        max_timestamp = self.data['TIMESTAMP'].max()
-        self.data['TIMESTAMP'] = (self.data['TIMESTAMP'] - min_timestamp) / (max_timestamp - min_timestamp)
-
-        lat_min, lat_max = self.data['LATITUDE'].min(), self.data['LATITUDE'].max()
-        lon_min, lon_max = self.data['LONGITUDE'].min(), self.data['LONGITUDE'].max()
-        self.data['LATITUDE'] = (self.data['LATITUDE'] - lat_min) / (lat_max - lat_min)
-        self.data['LONGITUDE'] = (self.data['LONGITUDE'] - lon_min) / (lon_max - lon_min)
-
-
-        # Select relevant columns
-        self.data = self.data[['LATITUDE', 'LONGITUDE', 'TIMESTAMP']]
-
-
-    def __len__(self):
-        return len(self.data) - self.seq_len
-
-    def __getitem__(self, idx):
-        events = self.data.iloc[idx:idx + self.seq_len]
-        x = torch.tensor(events[['LATITUDE', 'LONGITUDE', 'TIMESTAMP']].values[:self.seq_len - 1], dtype=torch.float32)
-        y = torch.tensor(events[['LATITUDE', 'LONGITUDE', 'TIMESTAMP']].values[-1], dtype=torch.float32)
-        return x, y
-
-
-def collate_fn(batch):
-    inputs, targets = zip(*batch)
-    inputs = torch.stack(inputs)
-    targets = torch.stack(targets)
-    return inputs, targets
-
+from data import NYPDSpatiotemporalDataset, collate_fn
 
 # Load the dataset
 dataset = NYPDSpatiotemporalDataset('database.csv', 10)
@@ -145,7 +99,7 @@ for epoch in range(epochs):
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
         patience_counter = 0
-        torch.save(model.state_dict(), 'best_transformer_model_dynamic.pth')
+        torch.save(model.state_dict(), 'best_transformer_model.pth')
     else:
         patience_counter += 1
 
@@ -153,5 +107,5 @@ for epoch in range(epochs):
         print("Early stopping triggered")
         break
 
-model.load_state_dict(torch.load('best_transformer_model_dynamic.pth'))
+model.load_state_dict(torch.load('best_transformer_model.pth'))
 model.eval()

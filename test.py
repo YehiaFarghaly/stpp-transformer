@@ -1,9 +1,12 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from model import Transformer, generate_event_thinning, hawkes_intensity_at_point
 from tqdm.auto import tqdm
+from torch.utils.data import DataLoader
+from model_kan import KANTransformer, generate_event_thinning, hawkes_intensity_at_point
+from model import Transformer, generate_event_thinning, hawkes_intensity_at_point
 from plot import plot_lambst_static
+from data import NYPDSpatiotemporalDataset, collate_fn
 # Load the trained model
 model_path = 'best_transformer_model.pth'
 src_input_dim = 3  # Now includes location (2) + time (1)
@@ -21,58 +24,79 @@ model = Transformer(src_input_dim, d_model, N, h, d_ff, dropout, src_seq_len, la
 model.load_state_dict(torch.load(model_path))
 model.eval()
 
-# Example usage with dummy data
-# Dummy event times and locations for testing (Batch size, Sequence length, Features)
-dummy_event_times = torch.tensor([[1.2, 2.1, 3.8, 2.5, 3.6, 4.7, 5.5, 6.9, 6.3, 5.2]], dtype=torch.float32)  # (Batch_size, Seq_len)
-dummy_event_locations = torch.tensor([[[2.67, 1.54], [5.67, 12.54], [1.02, 4.54], [12.527, 10.524], [19.7, 8.824], [2.67, 15.54], [9.67, 1.54], [11.02, 18.54], [6.127, 4.524], [9.7, 18.824] ]], dtype=torch.float32)  # (Batch_size, Seq_len, 2)
-# Combine times and locations into a single tensor (Batch_size, Seq_len, 3)
-dummy_event_data = torch.cat([dummy_event_locations, dummy_event_times.unsqueeze(-1)], dim=-1)  # (Batch_size, Seq_len, 3)
+test_dataset = NYPDSpatiotemporalDataset('test.csv', seq_len=src_seq_len)
+test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
 
-# Dummy T values (final time in the sequence for each batch)
-dummy_T = torch.tensor([15], dtype=torch.float32)  # (Batch_size,)
+
 
 # Define spatial range (as the model was trained on latitude and longitude, using a dummy range)
-spatial_range = [0, 20, 0, 20]
+all_event_data = []
+all_T_values = []
+
+for inputs, targets in test_dataloader:
+    all_event_data.append(inputs)
+    all_T_values.append(targets[:, -1])  # Last timestamp in the sequence as T
+
+all_event_data = torch.cat(all_event_data)
+all_T_values = torch.cat(all_T_values)
+
+spatial_range = [0, 1, 0, 1]
 
 # Predict future events using the thinning method
-all_predicted_events, all_rejected_events = generate_event_thinning(
-    dummy_event_data,
-    dummy_T,
+all_predicted_events, all_rejected_events, mu_values, alpha_values, beta_values, gamma_values = generate_event_thinning(
+    all_event_data,
+    all_T_values,
     model,
     spatial_range
 )
 
-accepted_events = torch.cat(all_predicted_events).numpy()
-rejected_events = torch.cat(all_rejected_events).numpy()
 
-print('accepted; ', accepted_events)
-# print('rejected; ', rejected_events)
+accepted_events = torch.cat(all_predicted_events).numpy()
+rejected_events = np.array([])
+if len(all_rejected_events) > 0:
+    rejected_events = torch.cat(all_rejected_events).numpy()
+       
+
 
 def calc_grid_intensity(x_num, y_num, t_num, t_start, t_end):
-    mu =  0.008582075242884457
-    alpha = 4.829000473022461   
-    beta =  3.209417991456576e-01   
-    gamma=  9.258946418762207
-    x_max = 20
-    y_max = 20
+       
+    x_max = 1
+    y_max = 1
     x_min = 0
     y_min = 0
-       
+    
     x_range = np.linspace(x_min, x_max, x_num)
     y_range = np.linspace(y_min, y_max, y_num)
     t_range = np.linspace(t_start, t_end, t_num)
+    
+    all_intensities = []
+    batch_size = len(mu_values)
+       
+    for batch_idx in range(batch_size):
+            mu = mu_values[batch_idx]
+            alpha = alpha_values[batch_idx]
+            beta = beta_values[batch_idx]
+            gamma = gamma_values[batch_idx]
+
+            intensities = []
+            for t in tqdm(t_range, desc=f"Batch {batch_idx+1}/{batch_size}"):
+                lamb_st = np.zeros((x_num, y_num))
+                for i, x in enumerate(x_range):
+                    for j, y in enumerate(y_range):
+                        lamb_st[i, j] = hawkes_intensity_at_point(
+                            all_event_data[batch_idx][:, -1],  # event_times
+                            all_event_data[batch_idx][:, :-1], 
+                            mu, alpha, beta, gamma, t, 
+                            torch.tensor([x, y])
+                        )
+                intensities.append(lamb_st)
+            
+            all_intensities.append(intensities)
         
-    intensities = []
-    for t in tqdm(t_range):
-        lamb_st = np.zeros((x_num, y_num))
-        for i, x in enumerate(x_range):
-            for j, y in enumerate(y_range):
-                
-                lamb_st[i, j] = hawkes_intensity_at_point(dummy_event_times[0], dummy_event_locations[0], mu, alpha, beta, gamma, t, torch.tensor([x, y]))
-        intensities.append(lamb_st)
-    return intensities, x_range, y_range, t_range
-intensities, x_range, y_range, t_range = calc_grid_intensity(21, 21, 31, 6, 15)
-# Print predicted times and locations
-plot_lambst_static(intensities, accepted_events, rejected_events,
+    return all_intensities, x_range, y_range, t_range
+
+all_intensities, x_range, y_range, t_range = calc_grid_intensity(15, 15, 25, 2, 70)
+
+plot_lambst_static(all_intensities, accepted_events, rejected_events,
                    x_range, y_range, t_range, 
-                   fps=3, fn='result.mp4')
+                   fps=20, fn='result.mp4')
