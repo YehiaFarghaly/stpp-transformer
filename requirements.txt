@@ -1,0 +1,11 @@
+torch==1.7.1
+torchvision
+numpy
+scipy
+matplotlib
+pandas
+scikit-learn
+tensorboard
+tqdm
+seaborn
+pykan
